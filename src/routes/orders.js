@@ -1,38 +1,34 @@
 const express = require('express');
 const pool = require('../db');
-
 const pessimisticOrder = require('../services/pessimisticService');
 const optimisticOrder = require('../services/optimisticService');
 
 const router = express.Router();
 
-/**
- * POST /api/orders/pessimistic
- */
+/* ---------- PESSIMISTIC ---------- */
 router.post('/pessimistic', async (req, res) => {
   const { productId, quantity, userId } = req.body;
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
-
     await pessimisticOrder(client, productId, quantity);
 
-    const orderResult = await client.query(
+    const order = await client.query(
       `INSERT INTO orders (product_id, quantity_ordered, user_id, status)
        VALUES ($1, $2, $3, 'SUCCESS') RETURNING id`,
       [productId, quantity, userId]
     );
 
     const product = await client.query(
-      'SELECT stock FROM products WHERE id=$1',
+      'SELECT stock FROM products WHERE id = $1',
       [productId]
     );
 
     await client.query('COMMIT');
 
     res.status(201).json({
-      orderId: orderResult.rows[0].id,
+      orderId: order.rows[0].id,
       productId,
       quantityOrdered: quantity,
       stockRemaining: product.rows[0].stock
@@ -43,11 +39,12 @@ router.post('/pessimistic', async (req, res) => {
 
     let status = 'FAILED_OUT_OF_STOCK';
     let code = 400;
-    let message = 'Insufficient stock';
+    let msg = 'Insufficient stock';
 
     if (err === 'NOT_FOUND') {
+      status = 'FAILED_OUT_OF_STOCK';
       code = 404;
-      message = 'Product not found';
+      msg = 'Product not found';
     }
 
     await pool.query(
@@ -56,15 +53,13 @@ router.post('/pessimistic', async (req, res) => {
       [productId, quantity, userId, status]
     );
 
-    res.status(code).json({ error: message });
+    res.status(code).json({ error: msg });
   } finally {
     client.release();
   }
 });
 
-/**
- * POST /api/orders/optimistic
- */
+/* ---------- OPTIMISTIC ---------- */
 router.post('/optimistic', async (req, res) => {
   const { productId, quantity, userId } = req.body;
   const maxRetries = Number(process.env.MAX_OPTIMISTIC_RETRIES || 3);
@@ -74,24 +69,24 @@ router.post('/optimistic', async (req, res) => {
 
     try {
       await client.query('BEGIN');
-
       await optimisticOrder(client, productId, quantity);
 
-      const orderResult = await client.query(
+      const order = await client.query(
         `INSERT INTO orders (product_id, quantity_ordered, user_id, status)
          VALUES ($1, $2, $3, 'SUCCESS') RETURNING id`,
         [productId, quantity, userId]
       );
 
       const product = await client.query(
-        'SELECT stock, version FROM products WHERE id=$1',
+        'SELECT stock, version FROM products WHERE id = $1',
         [productId]
       );
 
       await client.query('COMMIT');
+      client.release(); // ✅ IMPORTANT
 
       return res.status(201).json({
-        orderId: orderResult.rows[0].id,
+        orderId: order.rows[0].id,
         productId,
         quantityOrdered: quantity,
         stockRemaining: product.rows[0].stock,
@@ -100,21 +95,21 @@ router.post('/optimistic', async (req, res) => {
 
     } catch (err) {
       await client.query('ROLLBACK');
-      client.release();
+      client.release(); // ✅ IMPORTANT
 
       if (err === 'CONFLICT' && attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, 50 * attempt)); // exponential backoff
+        await new Promise(r => setTimeout(r, 50 * attempt));
         continue;
       }
 
       let status = 'FAILED_CONFLICT';
       let code = 409;
-      let message = 'Failed to place order due to concurrent modification. Please try again.';
+      let msg = 'Failed to place order due to concurrent modification. Please try again.';
 
       if (err === 'OUT_OF_STOCK') {
         status = 'FAILED_OUT_OF_STOCK';
         code = 400;
-        message = 'Insufficient stock';
+        msg = 'Insufficient stock';
       }
 
       await pool.query(
@@ -123,21 +118,19 @@ router.post('/optimistic', async (req, res) => {
         [productId, quantity, userId, status]
       );
 
-      return res.status(code).json({ error: message });
+      return res.status(code).json({ error: msg });
     }
   }
 });
 
-/**
- * GET /api/orders/stats
- */
-router.get('/stats', async (_, res) => {
+/* ---------- STATS ---------- */
+router.get('/stats', async (_req, res) => {
   const { rows } = await pool.query(`
     SELECT
       COUNT(*) AS total,
-      COUNT(*) FILTER (WHERE status='SUCCESS') AS success,
-      COUNT(*) FILTER (WHERE status='FAILED_OUT_OF_STOCK') AS out_of_stock,
-      COUNT(*) FILTER (WHERE status='FAILED_CONFLICT') AS conflict
+      COUNT(*) FILTER (WHERE status = 'SUCCESS') AS success,
+      COUNT(*) FILTER (WHERE status = 'FAILED_OUT_OF_STOCK') AS out_of_stock,
+      COUNT(*) FILTER (WHERE status = 'FAILED_CONFLICT') AS conflict
     FROM orders
   `);
 
